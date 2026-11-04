@@ -2,6 +2,7 @@
 import { useIntervalFn } from '@vueuse/core'
 import { computed, onMounted, ref, watch } from 'vue'
 import CommerceItemImage from '@/components/commerce/CommerceItemImage.vue'
+import { affordableCount } from '@/utils/purchase-count'
 import MilkTeaWork from './MilkTeaWork.vue'
 
 const { state, page, busy } = defineProps<{ state: any, page: string, busy: boolean }>()
@@ -55,6 +56,9 @@ function remaining(value: any) {
 function rewardsText(values: any[]) {
   return (values || []).map(v => `${v.name} ×${v.count}`).join('、')
 }
+function limitLabel(period: string) {
+  return ({ daily: '每日限购', weekly: '每周限购', monthly: '每月限购', permanent: '永久限购' } as Record<string, string>)[period] || '限购'
+}
 function fruitsOf(recipe: any) {
   return (state?.fruits || []).filter((v: any) => v.id === recipe.fruitId)
 }
@@ -68,6 +72,14 @@ function switchPage(value: string) {
 }
 function select(action: string, title: string, input: any = {}, costs?: any[], rewards?: any[], max?: number) {
   emit('confirmation', { action, title, input, costs, rewards, quantity: max !== undefined, max })
+}
+function exchangeMax(goods: any) {
+  const byBalance = affordableCount((goods?.costs || []).map((cost: any) => ({
+    id: cost.id,
+    count: Number(cost.count),
+    balance: Number(state?.balances?.[cost.id] ?? Number.NaN),
+  })))
+  return Math.min(9999, goods?.remaining ?? 9999, byBalance)
 }
 function request(action = '', input: any = {}) {
   if (action)
@@ -352,9 +364,9 @@ onMounted(() => {
           <div class="item-row" :class="{ 'item-row--set': goods.rewards.length > 1 }">
             <span v-for="reward in goods.rewards" :key="reward.id" class="item-box" :title="reward.name"><CommerceItemImage :src="reward.image" :alt="reward.name" /><b>{{ reward.count }}</b></span>
           </div>
-          <small v-if="goods.remaining !== null">剩余 {{ goods.remaining }}</small>
-          <small v-for="condition in goods.conditions" :key="condition.type">需店铺等级 {{ condition.target }}（当前 {{ condition.current }}）</small>
-          <button class="primary price" :disabled="busy || !state.active || !goods.available" @click="select('exchange', goods.name || goods.rewards[0]?.name, { goodsId: goods.id }, goods.costs, goods.rewards, Math.min(9999, goods.remaining ?? 9999))">
+          <small v-if="goods.remaining !== null">{{ limitLabel(goods.limitPeriod) }} {{ goods.remaining }}/{{ goods.purchaseLimit }}</small>
+          <small v-for="condition in goods.conditions.filter((value: any) => !value.satisfied)" :key="condition.type">需店铺等级 {{ condition.target }}（当前 {{ condition.current }}）</small>
+          <button class="primary price" :disabled="busy || !state.active || !goods.available" @click="select('exchange', goods.name || goods.rewards[0]?.name, { goodsId: goods.id }, goods.costs, goods.rewards, exchangeMax(goods))">
             <template v-if="goods.remaining === 0">
               已售罄
             </template>

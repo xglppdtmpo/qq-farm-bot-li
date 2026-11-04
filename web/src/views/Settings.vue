@@ -872,6 +872,7 @@ function normalizeFertilizerLandTypes(input: unknown) {
 const localAutomationSettings = ref({
   automation: {
     farm: false,
+    farm_harvest_tiangong: true,
     task: false,
     sell: true,
     friend: false,
@@ -942,6 +943,7 @@ function syncLocalAutomationSettings() {
     if (!settings.value.automation) {
       localAutomationSettings.value.automation = {
         farm: false,
+        farm_harvest_tiangong: true,
         task: false,
         sell: false,
         friend: false,
@@ -991,6 +993,7 @@ function syncLocalAutomationSettings() {
     else {
       const defaults = {
         farm: false,
+        farm_harvest_tiangong: true,
         task: false,
         sell: false,
         friend: false,
