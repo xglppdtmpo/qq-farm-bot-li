@@ -94,6 +94,7 @@ function normalizeRecipes(reply: any) {
 }
 function normalizeShop(value: any) {
     const result = plain(types.MilkTeaOperateReply, { milk_tea_get_shop: { shop: value } }).milk_tea_get_shop.shop;
+    result.slots ??= [];
     for (const key of ['drink_cups', 'pending_cups_by_recipe', 'pending_cups_by_source', 'boost_coin_price']) result[key] = cupMap(value[key]);
     result.pending_rewards = items(value.pending_rewards);
     result.boost_preview_rewards = items(value.boost_preview_rewards);
@@ -108,8 +109,6 @@ function normalizeGoods(entry: any, settling: boolean) {
     const limitPeriod = ({ 1: 'daily', 2: 'weekly', 3: 'monthly', 4: 'permanent' } as Record<number, string>)[toNum(entry.restriction_type)] || 'unknown';
     return { id: String(entry.id), name: entry.name, description: entry.desc, rewards: items(entry.item), costs: items(entry.cost),
         remaining, purchaseLimit: limit > 0 ? limit : null, limitPeriod, conditions, category: entry.category_tag,
-        // order/diamondCost 给自动购买用：按官方列表顺序挑、带钻石价签的一律不碰。
-        order: toNum(entry.order), diamondCost: toNum(entry.diamond_cost_count),
         available: remaining !== 0 && conditions.every((v: any) => v.satisfied) && !(settling && entry.category_tag === 'seed'),
     };
 }
