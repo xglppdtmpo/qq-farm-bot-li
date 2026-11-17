@@ -31,6 +31,16 @@ const fertilizerLandTypeOptions = [
 
 const router = useRouter()
 const route = useRoute()
+const inRanch = computed(() => route.meta.gameSpace === 'ranch')
+const ranchAnimalOptions = ref<Array<{ value: number, label: string, kind: string }>>([])
+onMounted(async () => {
+  try {
+    const response = await api.get('/api/ranch/automation-options')
+    if (response.data.ok)
+      ranchAnimalOptions.value = response.data.data
+  }
+  catch (error) { showAlert(getApiErrorMessage(error, '牧场动物选项读取失败'), 'danger') }
+})
 const accountStore = useAccountStore()
 const userStore = useUserStore()
 const settingStore = useSettingStore()
@@ -39,10 +49,13 @@ const statusStore = useStatusStore()
 type SettingsTab = 'account' | 'strategy' | 'automation' | 'system'
 const storedTab = localStorage.getItem('settings-active-tab')
 const settingsTabKeys: SettingsTab[] = ['account', 'strategy', 'automation', 'system']
+// 牧场的自动化与养殖策略已移到「牧场策略」页，设置页只保留账号与系统。
+const ranchTabKeys: SettingsTab[] = ['account', 'system']
 const queryTab = String(route.query.tab || '')
-const initialTab = settingsTabKeys.includes(queryTab as SettingsTab)
+const storedInitialTab = settingsTabKeys.includes(queryTab as SettingsTab)
   ? queryTab as SettingsTab
   : storedTab === 'user' ? 'system' : (storedTab as SettingsTab) || 'account'
+const initialTab = inRanch.value && !ranchTabKeys.includes(storedInitialTab) ? 'account' : storedInitialTab
 const activeTab = ref<SettingsTab>(initialTab)
 
 // 系统设置仅管理员可见（服务端同样有权限校验）
@@ -63,6 +76,8 @@ watch(activeTab, (newTab) => {
 
 watch(() => route.query.tab, (value) => {
   const nextTab = String(value || '')
+  if (inRanch.value && !ranchTabKeys.includes(nextTab as SettingsTab))
+    return
   if (settingsTabKeys.includes(nextTab as SettingsTab) && nextTab !== activeTab.value)
     activeTab.value = nextTab as SettingsTab
 })
@@ -73,6 +88,8 @@ const tabs = computed(() => [
   { key: 'automation', label: '自动控制', icon: 'i-carbon-settings-adjust' },
   ...(isAdmin.value ? [{ key: 'system', label: '系统设置', icon: 'i-carbon-settings' }] : []),
 ] as Array<{ key: SettingsTab, label: string, icon: string }>)
+
+const visibleTabs = computed(() => inRanch.value ? tabs.value.filter(tab => ranchTabKeys.includes(tab.key)) : tabs.value)
 
 function setActiveTab(value: string) {
   if (tabs.value.some(tab => tab.key === value))
@@ -900,20 +917,6 @@ const localAutomationSettings = ref({
     fertilizer_land_types: [...defaultFertilizerLandTypes],
     fertilizer_smart_seconds: 300,
     show_manual_fertilizer: true,
-    milk_tea_claim_rewards: true,
-    milk_tea_claim_wages: true,
-    milk_tea_claim_fund: true,
-    milk_tea_happy_daily: true,
-    milk_tea_happy_share: true,
-    milk_tea_happy_milestones: true,
-    milk_tea_craft: true,
-    milk_tea_hire: true,
-    milk_tea_upgrade: true,
-    milk_tea_boost: true,
-    milk_tea_work_interact: true,
-    milk_tea_hire_duration_id: 1,
-    milk_tea_hire_talent_id: 0,
-    milk_tea_hire_allow_robots: true,
     solar_calendar_claim_events: true,
     solar_calendar_claim_seasons: true,
     solar_calendar_answer_quiz: true,
@@ -972,20 +975,6 @@ function syncLocalAutomationSettings() {
         fertilizer_land_types: [...allFertilizerLandTypes],
         fertilizer_smart_seconds: 300,
         show_manual_fertilizer: true,
-        milk_tea_claim_rewards: true,
-        milk_tea_claim_wages: true,
-        milk_tea_claim_fund: true,
-        milk_tea_happy_daily: true,
-        milk_tea_happy_share: true,
-        milk_tea_happy_milestones: true,
-        milk_tea_craft: true,
-        milk_tea_hire: true,
-        milk_tea_upgrade: true,
-        milk_tea_boost: true,
-        milk_tea_work_interact: true,
-        milk_tea_hire_duration_id: 1,
-        milk_tea_hire_talent_id: 0,
-        milk_tea_hire_allow_robots: true,
         solar_calendar_claim_events: true,
         solar_calendar_claim_seasons: true,
         solar_calendar_answer_quiz: true,
@@ -1022,20 +1011,6 @@ function syncLocalAutomationSettings() {
         fertilizer_land_types: [...allFertilizerLandTypes],
         fertilizer_smart_seconds: 300,
         show_manual_fertilizer: true,
-        milk_tea_claim_rewards: true,
-        milk_tea_claim_wages: true,
-        milk_tea_claim_fund: true,
-        milk_tea_happy_daily: true,
-        milk_tea_happy_share: true,
-        milk_tea_happy_milestones: true,
-        milk_tea_craft: true,
-        milk_tea_hire: true,
-        milk_tea_upgrade: true,
-        milk_tea_boost: true,
-        milk_tea_work_interact: true,
-        milk_tea_hire_duration_id: 1,
-        milk_tea_hire_talent_id: 0,
-        milk_tea_hire_allow_robots: true,
         solar_calendar_claim_events: true,
         solar_calendar_claim_seasons: true,
         solar_calendar_answer_quiz: true,
@@ -1072,8 +1047,11 @@ async function saveAutomationSettings() {
     return
   automationSaving.value = true
   try {
-    const payload = JSON.parse(JSON.stringify(localAutomationSettings.value))
-    payload.automation.fertilizer_land_types = normalizeFertilizerLandTypes(payload.automation.fertilizer_land_types)
+    const source = localAutomationSettings.value
+    const automation = Object.fromEntries(Object.entries(source.automation).filter(([key]) => key.startsWith('ranch_') === inRanch.value))
+    const payload = inRanch.value ? { automation } : { ...JSON.parse(JSON.stringify(source)), automation }
+    if (!inRanch.value)
+      payload.automation.fertilizer_land_types = normalizeFertilizerLandTypes(payload.automation.fertilizer_land_types)
     const res = await settingStore.saveSettings(accountId, payload)
     if (accountId !== currentAccountId.value)
       return
@@ -1082,7 +1060,7 @@ async function saveAutomationSettings() {
       showAlert('自动控制设置已保存', 'primary')
 
       // 如果启用了自动购买化肥，立即检测并购买
-      if (payload.automation.fertilizer_buy_organic || payload.automation.fertilizer_buy_normal) {
+      if (!inRanch.value && (payload.automation.fertilizer_buy_organic || payload.automation.fertilizer_buy_normal)) {
         try {
           const buyRes = await api.post('/api/fertilizer/check-and-buy', {
             buyOrganic: payload.automation.fertilizer_buy_organic,
@@ -1528,7 +1506,7 @@ async function handleResetSystemConfig() {
   <div class="settings-page page-stack">
     <div class="settings-content">
       <PageTabs :value="activeTab" @update:value="setActiveTab">
-        <NTab v-for="tab in tabs" :key="tab.key" :name="tab.key">
+        <NTab v-for="tab in visibleTabs" :key="tab.key" :name="tab.key">
           <span class="inline-flex items-center gap-2">
             <span :class="tab.icon" />
             {{ tab.label }}
@@ -1716,7 +1694,7 @@ async function handleResetSystemConfig() {
         </div>
 
         <!-- 策略设置 -->
-        <div v-else-if="activeTab === 'strategy'" class="space-y-4">
+        <div v-else-if="activeTab === 'strategy' && !inRanch" class="space-y-4">
           <div class="flex items-center justify-between">
             <h3 class="flex items-center gap-2 text-lg text-gray-900 font-bold dark:text-gray-100">
               <div class="i-fas-cog text-lg" />
@@ -1991,6 +1969,8 @@ async function handleResetSystemConfig() {
             v-else
             v-model="localAutomationSettings"
             :saving="automationSaving"
+            :in-ranch="inRanch"
+            :ranch-animal-options="ranchAnimalOptions"
             :fertilizer-land-type-options="fertilizerLandTypeOptions"
             :fertilizer-options="fertilizerOptions"
             @save="saveAutomationSettings"

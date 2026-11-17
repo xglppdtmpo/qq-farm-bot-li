@@ -22,11 +22,16 @@ export type AutomationSettingsFormModel = Pick<
   | 'autoAcceptHarvestStealSteal'
 > & { emailClaimHour: number | string }
 
-defineProps<{
+withDefaults(defineProps<{
+  inRanch?: boolean
+  panel?: 'automation' | 'strategy'
+  /** 页面级统一保存时隐藏表单自带的底部按钮。 */
+  hideSave?: boolean
+  ranchAnimalOptions?: Array<{ value: number, label: string, kind: string }>
   saving: boolean
   fertilizerLandTypeOptions: Array<{ label: string, value: string }>
   fertilizerOptions: Array<{ label: string, value: string }>
-}>()
+}>(), { inRanch: false, panel: 'automation', ranchAnimalOptions: () => [] })
 
 const emit = defineEmits<{
   save: []
@@ -34,27 +39,90 @@ const emit = defineEmits<{
 
 const settings = defineModel<AutomationSettingsFormModel>({ required: true })
 
-// 奶茶雇佣的三档班次和四个特长取自官方活动配置（MilkTeaHireDurationConfig / MilkTeaTalentConfig），
-// 特长 0 表示不限；档价只是配置标价，真正扣多少由服务端当轮报价决定。
-const milkTeaHireDurationOptions = [
-  { label: '4 小时（档价 40 奶茶券）', value: 1 },
-  { label: '12 小时（档价 130 奶茶券）', value: 2 },
-  { label: '24 小时（档价 270 奶茶券）', value: 3 },
-]
-
-const milkTeaHireTalentOptions = [
-  { label: '不限特长（随机雇一位）', value: 0 },
-  { label: '金牌销售 · 金币收入 +10%', value: 9001 },
-  { label: '金牌宣传 · 热卖值 +10%', value: 9002 },
-  { label: '金牌服务 · 售出有概率得宣传喇叭', value: 9003 },
-  { label: '默默搬砖 · 热卖值 +5%', value: 9004 },
+const ranchSwitches = [
+  ['ranch_harvest', '自动收获'],
+  ['ranch_produce', '自动生产'],
+  ['ranch_buy', '自动补栏（金券）'],
+  ['ranch_upgrade', '自动升级建筑（金券）'],
+  ['ranch_sell', '自动出售产物'],
+  ['ranch_market_organic', '仓鼠集市兑换有机化肥（便便）'],
+  ['ranch_clean', '自动清理'],
+  ['ranch_grass', '自动补充牧草'],
+  ['ranch_grass_buy', '牧草不足时购买（金券）'],
+  ['ranch_fill_cans', '自动填充库存罐头'],
+  ['ranch_feed_normal', '普通罐头喂养'],
+  ['ranch_feed_organic', '有机罐头喂养'],
+  ['ranch_task', '自动领取任务奖励'],
+  ['ranch_share', '每日分享礼包'],
+  ['ranch_daily_benefit', '每日商城福利'],
+] as const
+const ranchFriendSwitches = [
+  ['ranch_friend_steal', '自动偷取产物'],
+  ['ranch_friend_clean', '自动清理'],
+  ['ranch_stroke', '自动抚摸动物'],
+  ['ranch_friend_mosquito', '自动放蚊子'],
+] as const
+const ranchStrategies = [
+  { label: '按已解锁等级', value: 'level' },
+  { label: '指定动物', value: 'preferred' },
+  { label: '优先背包幼崽', value: 'bag_priority' },
 ]
 </script>
 
 <template>
   <div class="space-y-4">
-    <div class="automation-card-layout">
-      <div class="automation-card-column">
+    <div class="automation-card-layout" :class="{ 'automation-card-layout--single': inRanch }">
+      <div v-if="inRanch" class="automation-card-column">
+        <section class="farm-card rounded-2xl p-4">
+          <div class="mb-4 flex items-start gap-3">
+            <div class="h-9 w-9 flex shrink-0 items-center justify-center rounded-lg bg-green-50 text-green-600 dark:bg-green-900/25 dark:text-green-400">
+              <span class="i-fa-solid-paw text-xl" />
+            </div>
+            <div>
+              <h4 class="text-base text-gray-900 font-bold dark:text-gray-100">
+                {{ panel === 'strategy' ? '养殖策略' : '日常牧场' }}
+              </h4>
+              <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                {{ panel === 'strategy' ? '按窝、棚空位补栏，优先使用所选动物的库存幼崽' : '管理生产、收获、补栏与每日奖励' }}
+              </p>
+            </div>
+          </div>
+          <div v-if="panel === 'automation'" class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <div v-for="[key, label] in ranchSwitches" :key="key" class="automation-setting-item">
+              <BaseSwitch v-model="settings.automation[key]" :label="label" :disabled="key === 'ranch_grass_buy' && !settings.automation.ranch_grass" />
+            </div>
+            <div class="col-span-full text-xs text-gray-500 dark:text-gray-400">
+              仓鼠集市仅用便便，优先兑换4小时再兑换1小时；每6小时检查，便便增加即触发兑换。
+            </div>
+            <div class="automation-setting-item">
+              <BaseInput v-model.number="settings.automation.ranch_grass_threshold_percent" class="w-full" label="牧草余量低于（%）时补满" type="number" min="1" max="100" step="1" :disabled="!settings.automation.ranch_grass" />
+            </div>
+            <div class="automation-setting-item">
+              <BaseInput v-model.number="settings.automation.ranch_check_minutes" class="w-full" label="巡查间隔（分钟）" type="number" min="1" max="60" step="1" />
+            </div>
+          </div>
+          <div v-if="panel === 'automation'" class="mt-4">
+            <h4 class="mb-2 text-sm font-bold">
+              好友互动
+            </h4>
+            <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div v-for="[key, label] in ranchFriendSwitches" :key="key" class="automation-setting-item">
+                <BaseSwitch v-model="settings.automation[key]" :label="label" />
+              </div>
+            </div>
+          </div>
+          <div v-else class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <BaseSelect v-model="settings.automation.ranch_strategy" label="养殖策略" :options="ranchStrategies" />
+            <BaseSelect v-if="settings.automation.ranch_strategy === 'bag_priority'" v-model="settings.automation.ranch_bag_fallback" label="库存不足时" :options="ranchStrategies.slice(0, 2)" />
+            <template v-if="settings.automation.ranch_strategy === 'preferred' || settings.automation.ranch_strategy === 'bag_priority' && settings.automation.ranch_bag_fallback === 'preferred'">
+              <BaseSelect v-model="settings.automation.ranch_coop_animal" label="窝 · 指定动物" :options="[{ value: 0, label: '不购买' }, ...ranchAnimalOptions.filter(animal => animal.kind === '窝')]" />
+              <BaseSelect v-model="settings.automation.ranch_shed_animal" label="棚 · 指定动物" :options="[{ value: 0, label: '不购买' }, ...ranchAnimalOptions.filter(animal => animal.kind === '棚')]" />
+            </template>
+          </div>
+        </section>
+      </div>
+
+      <div v-if="!inRanch" class="automation-card-column">
         <section class="farm-card rounded-2xl p-4">
           <div class="mb-4 flex items-start gap-3">
             <div class="h-9 w-9 flex shrink-0 items-center justify-center rounded-lg bg-green-50 text-green-600 dark:bg-green-900/25 dark:text-green-400">
@@ -206,7 +274,7 @@ const milkTeaHireTalentOptions = [
         </section>
       </div>
 
-      <div class="automation-card-column">
+      <div v-if="!inRanch" class="automation-card-column">
         <section class="farm-card rounded-2xl p-4">
           <div class="mb-4 flex items-start gap-3">
             <div class="h-9 w-9 flex shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-600 dark:bg-blue-900/25 dark:text-blue-400">
@@ -289,90 +357,6 @@ const milkTeaHireTalentOptions = [
 
         <section class="farm-card rounded-2xl p-4">
           <div class="mb-4 flex items-start gap-3">
-            <div class="h-9 w-9 flex shrink-0 items-center justify-center rounded-lg bg-amber-50 text-amber-600 dark:bg-amber-900/25 dark:text-amber-400">
-              <span class="i-carbon-cafe text-xl" />
-            </div>
-            <div>
-              <h4 class="text-base text-gray-900 font-bold dark:text-gray-100">
-                奶茶热销中
-              </h4>
-              <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
-                默认全开：前六项只领服务端已经判定「可以领」的收益，后五项会花东西或要上班，雇佣怎么挑人可以在下面改
-              </p>
-            </div>
-          </div>
-
-          <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_claim_rewards" label="自动领取收银台收益" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_claim_wages" label="自动领取员工工资" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_claim_fund" label="自动领取成长基金档位" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_happy_daily" label="自动领取每日快乐值" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_happy_share" label="自动领取首次分享" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_happy_milestones" label="自动领取快乐档位奖励" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_craft" label="自动制作奶茶（消耗果实）" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_hire" label="自动雇佣员工（花奶茶券）" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_upgrade" label="自动店铺升级（花店内金币）" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_boost" label="自动一键爆单（花宣传喇叭）" />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_work_interact" label="自动工作互动·花式摇杯（被雇时）" />
-            </div>
-          </div>
-          <div v-if="settings.automation.milk_tea_hire" class="mt-3 rounded-lg bg-amber-50 p-3 space-y-3 dark:bg-amber-900/20">
-            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <BaseSelect
-                v-model="settings.automation.milk_tea_hire_duration_id"
-                label="雇佣班次"
-                :options="milkTeaHireDurationOptions"
-              />
-              <BaseSelect
-                v-model="settings.automation.milk_tea_hire_talent_id"
-                label="只雇这个特长"
-                :options="milkTeaHireTalentOptions"
-              />
-            </div>
-            <div class="automation-setting-item">
-              <BaseSwitch v-model="settings.automation.milk_tea_hire_allow_robots" label="把机器人也算进可雇佣候选" />
-            </div>
-            <p class="text-xs text-gray-500 dark:text-gray-400">
-              班次越长花奶茶券越多（档价 40／130／270，实际以服务端当轮报价为准，可能含推广奖金），要求的剩余营业时间也更长——选 24 小时档时，剩余营业时间不够一轮就只记跳过。选了特长就只雇这一档的人，当轮没有对应特长的可雇人选时同样只记跳过，不会退回去雇别人。
-            </p>
-          </div>
-          <p class="mt-3 text-xs text-gray-500 dark:text-gray-400">
-            半小时检查一次，一轮里十一项排队执行、项间隔 800ms，不并发。这十一个开关默认是开的，不要哪项就在下面关掉哪项；已经手动关掉的账号不会被重新打开。成长基金只领已达档位，解锁要你在活动页确认付费；没开业的店铺会跳过并记一行日志。
-          </p>
-          <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
-            制作按背包顺序取未锁定的有库存果实，整堆提交，每批最多 20 堆、一轮最多 6 批，做完一轮接着做；雇佣取第一个空位，在可雇佣的候选里随机一位（班次、特长、要不要机器人见上面三行）；升级达标即升；爆单按待售杯数决定喇叭用量（向上取整，受持有量和单次上限 9999 约束），没有待售就不花喇叭。这几项都会花你的果实、奶茶券、店内金币、宣传喇叭，确认后再接着开。
-          </p>
-          <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
-            工作互动不花任何东西，只在「我被别人雇去当班」时才做，固定选花式摇杯（互动类型 2：老板那一班未来 3 小时的奶茶券收益 +10%，我自己拿本班工资的 30% 作为奖金，这一项在配置里没有失败分支）。这一班没互动过、还没下班、服务端说还有互动次数，三项都满足才会发请求；没被雇、已经下班、次数用完都只按天记一行跳过。另外四种互动（宣传推广、招牌试饮、划水摸鱼、申请涨薪）有赔有赚，仍然由你在「我的工作」页面自己点。
-          </p>
-          <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
-            暂不提供自动开关：开业/改名（要店名）、兑换购买（要挑东西，之前那版「自动买种子」已按要求撤掉）、成长基金解锁（要花钻石）、工作互动里花式摇杯之外的另外四项（有赔有赚，要选互动类型）、躺平模式开关（改了会影响好友能否雇你）。这些都得由你拿主意，做成开关只会空转。
-          </p>
-        </section>
-
-        <section class="farm-card rounded-2xl p-4">
-          <div class="mb-4 flex items-start gap-3">
             <div class="h-9 w-9 flex shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600 dark:bg-emerald-900/25 dark:text-emerald-400">
               <span class="i-carbon-calendar text-xl" />
             </div>
@@ -402,6 +386,40 @@ const milkTeaHireTalentOptions = [
           </p>
           <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
             答题只提交官方活动配置里标注过 <code>answer_index</code> 的节令（2026-10-19 起：重阳选「A.敬老节」、霜降选「C.最后一个」）。没有标注就一行跳过、绝不动手写请求，因为答错要锁到第二天——那种题请在「节令日历」页面自己点，页面上已经把「正确答案」标出来了。标注的答案若出现在服务端给的错项记录里，也当标注不可信、跳过。
+          </p>
+        </section>
+
+        <section class="farm-card rounded-2xl p-4">
+          <div class="mb-4 flex items-start gap-3">
+            <div class="h-9 w-9 flex shrink-0 items-center justify-center rounded-lg bg-amber-50 text-amber-600 dark:bg-amber-900/25 dark:text-amber-400">
+              <span class="i-carbon-gift text-xl" />
+            </div>
+            <div>
+              <h4 class="text-base text-gray-900 font-bold dark:text-gray-100">
+                牧歌初启
+              </h4>
+              <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                都在服务端判定「这一步可做」时才发请求，默认开
+              </p>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <div class="automation-setting-item">
+              <BaseSwitch v-model="settings.automation.muge_claim_rewards" label="自动领取四类奖励（全服档位 / 好友助力 / 手册任务 / 手册积分档位）" />
+            </div>
+            <div class="automation-setting-item">
+              <BaseSwitch v-model="settings.automation.muge_finish_survey" label="答完题后自动结算人格并领首次分享奖励" />
+            </div>
+          </div>
+          <p class="mt-3 text-xs text-gray-500 dark:text-gray-400">
+            半小时检查一次，一轮只读一次活动状态，四类领取排队执行、笔间隔 800ms，每类一次写就领完该类全部可领项。手册任务排在积分档位之前，这样同一轮里积分就能达标。不在开放窗口、或者这一步已经做过，只按天记一行跳过日志，不发写请求；某一笔写入回包未确认就中止本轮、绝不重试，剩下的下一轮重新读。
+          </p>
+          <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+            人格测试<strong>不会替你选答案</strong>：10 题全部作答是服务端结算的前置条件，只有你已经在游戏里答完、却没按结算时才会结算，随后领一次性的首次分享奖励。没答完就一行跳过，留给你在「牧歌初启」页面自己选——答案决定你的牧场人格，属于你的偏好。
+          </p>
+          <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+            牧歌是农场场景的活动（与节令同侧），全程不切场景；整个任务串进和农场/牧场同一把全局锁，任务之间留 1500ms 缝，不会并发抢连接。
           </p>
         </section>
 
@@ -466,7 +484,7 @@ const milkTeaHireTalentOptions = [
       </div>
     </div>
 
-    <div class="flex justify-end gap-2 border-t pt-3 dark:border-gray-700">
+    <div v-if="!hideSave" class="flex justify-end gap-2 border-t pt-3 dark:border-gray-700">
       <BaseButton variant="primary" size="sm" :loading="saving" @click="emit('save')">
         保存自动控制
       </BaseButton>
@@ -521,5 +539,8 @@ const milkTeaHireTalentOptions = [
   .automation-card-layout section {
     margin-bottom: 1rem;
   }
+}
+.automation-card-layout--single {
+  display: block;
 }
 </style>

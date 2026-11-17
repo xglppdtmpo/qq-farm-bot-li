@@ -1,3 +1,4 @@
+import type { RanchAutomationConfig } from '../config/ranch-automation';
 export {};
 export type PlantingStrategy =
   | 'preferred'
@@ -14,7 +15,7 @@ export type FertilizerMode = 'both' | 'normal' | 'organic' | 'smart' | 'none';
 
 export type FertilizerLandType = 'blue-crystal' | 'purple-gold' | 'gold' | 'black' | 'red' | 'normal';
 
-export interface AutomationConfig {
+export interface AutomationConfig extends RanchAutomationConfig {
   farm: boolean;
   farm_harvest_tiangong: boolean;
   farm_push: boolean;
@@ -44,23 +45,11 @@ export interface AutomationConfig {
   fertilizer_smart_seconds: number;
   skip_own_weed_bug: boolean;
   show_manual_fertilizer: boolean;
-  milk_tea_claim_rewards: boolean;
-  milk_tea_claim_wages: boolean;
-  milk_tea_claim_fund: boolean;
-  milk_tea_happy_daily: boolean;
-  milk_tea_happy_share: boolean;
-  milk_tea_happy_milestones: boolean;
-  milk_tea_craft: boolean;
-  milk_tea_hire: boolean;
-  milk_tea_upgrade: boolean;
-  milk_tea_boost: boolean;
-  milk_tea_work_interact: boolean;
-  milk_tea_hire_duration_id: number;
-  milk_tea_hire_talent_id: number;
-  milk_tea_hire_allow_robots: boolean;
   solar_calendar_claim_events: boolean;
   solar_calendar_claim_seasons: boolean;
   solar_calendar_answer_quiz: boolean;
+  muge_claim_rewards: boolean;
+  muge_finish_survey: boolean;
 }
 
 export interface IntervalConfig {

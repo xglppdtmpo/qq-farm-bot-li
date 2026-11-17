@@ -3,6 +3,31 @@ import { ref } from 'vue'
 import api, { getApiErrorMessage } from '@/api'
 
 export interface AutomationConfig {
+  ranch_harvest?: boolean
+  ranch_produce?: boolean
+  ranch_buy?: boolean
+  ranch_upgrade?: boolean
+  ranch_sell?: boolean
+  ranch_market_organic?: boolean
+  ranch_grass?: boolean
+  ranch_grass_buy?: boolean
+  ranch_grass_threshold_percent?: number
+  ranch_fill_cans?: boolean
+  ranch_feed_normal?: boolean
+  ranch_feed_organic?: boolean
+  ranch_clean?: boolean
+  ranch_stroke?: boolean
+  ranch_friend_steal?: boolean
+  ranch_friend_clean?: boolean
+  ranch_friend_mosquito?: boolean
+  ranch_task?: boolean
+  ranch_share?: boolean
+  ranch_daily_benefit?: boolean
+  ranch_check_minutes?: number
+  ranch_strategy?: string
+  ranch_bag_fallback?: string
+  ranch_coop_animal?: number
+  ranch_shed_animal?: number
   farm?: boolean
   farm_harvest_tiangong?: boolean
   farm_push?: boolean
@@ -32,23 +57,11 @@ export interface AutomationConfig {
   mystery_shop_purchase_notify?: boolean
   skip_own_weed_bug?: boolean
   show_manual_fertilizer?: boolean
-  milk_tea_claim_rewards?: boolean
-  milk_tea_claim_wages?: boolean
-  milk_tea_claim_fund?: boolean
-  milk_tea_happy_daily?: boolean
-  milk_tea_happy_share?: boolean
-  milk_tea_happy_milestones?: boolean
-  milk_tea_craft?: boolean
-  milk_tea_hire?: boolean
-  milk_tea_upgrade?: boolean
-  milk_tea_boost?: boolean
-  milk_tea_work_interact?: boolean
-  milk_tea_hire_duration_id?: number
-  milk_tea_hire_talent_id?: number
-  milk_tea_hire_allow_robots?: boolean
   solar_calendar_claim_events?: boolean
   solar_calendar_claim_seasons?: boolean
   solar_calendar_answer_quiz?: boolean
+  muge_claim_rewards?: boolean
+  muge_finish_survey?: boolean
 }
 
 export interface IntervalsConfig {

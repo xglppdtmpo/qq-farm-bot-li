@@ -1,13 +1,13 @@
 # TSDK Node.js 运行约定
 
-微信账号现使用独立的 `tsdk-wx.wasm`（`v3.9.0.1792565883`，SHA-256 `9c8b1ca061d8e122dd902ff651755d9d2f2006fdf5483765bffd9b9c10aee6ad`）；下述 QQ 向量与宿主参数仅适用于 QQ。平台选择及已知 ACEVM 限制见 [微信连接诊断](wechat-connection.md)。实际加载的资源路径与哈希分别记录为 diagnostics 的 `wasmPath` 和 `wasmSha256`。
+微信账号使用独立的 `tsdk-wx.wasm`（2026-11-17 第 82 版官方包中的 `v3.9.0.1794837963`，160,956 bytes，SHA-256 `d14a4f5d59c8a27128019dbad25fe3cd3d5243dfc389eb9bcbb345efb1cebc9a`）；下述 QQ 向量与宿主参数仅适用于 QQ。平台选择及已知 ACEVM 限制见 [微信连接诊断](wechat-connection.md)。实际加载的资源路径与哈希分别记录为 diagnostics 的 `wasmPath` 和 `wasmSha256`。
 
 ## 版本与来源
 
-项目当前使用 `core/src/utils/tsdk.wasm`，来源为 2026-10-22 官方 QQ 小游戏 `1.15.1.4_20261001` 中的 TSDK `v3.9.0.1792566360`，文件大小为 160,956 bytes，SHA-256 为：
+项目当前使用 `core/src/utils/tsdk.wasm`，来源为 2026-11-17 官方 QQ 小游戏缓存 `1.17.0.4_20261117` 中的 TSDK `v3.9.0.1794737607`，文件大小为 161,118 bytes，SHA-256 为：
 
 ```text
-d1cd42c1f4f4cb15f111f16879f0edf7bf8d4a69a1bfe80d40138fdf3132dc15
+ab6eb0f0ee86ce8984b0c37a481ff51e7722961ff0b50a9f91e2fa9ff351ce74
 ```
 
 运行时固定参数：
@@ -17,9 +17,15 @@ d1cd42c1f4f4cb15f111f16879f0edf7bf8d4a69a1bfe80d40138fdf3132dc15
 - TSDK gameId：`3167`
 - appKey：`0`
 
-App ID 和宿主输入按账号平台选择。QQ 使用官方桌面端的设备文本 `windows;windows;windows 10.0;0;`、用户目录 `qqfile://usr/`，并在宿主不存在 `getAppBaseInfo` 时返回 debug 状态 `0`；微信账号继续使用项目设备配置、账号隔离目录和微信 App ID；设备平台转成微信使用的小写形式，debug 保留 `2`。QQ 虚拟用户目录收到的文件访问仍会安全映射到该账号自己的本地 TSDK 数据目录。
+App ID 和宿主输入按账号平台选择。QQ 使用官方桌面端的设备文本 `windows;windows;windows 10.0;0;`、用户目录 `qqfile://usr/`，并在宿主不存在 `getAppBaseInfo` 时返回 debug 状态 `0`；微信账号继续使用项目设备配置、账号隔离目录和微信 App ID，其中设备平台按微信格式转成小写，debug 保留 `2`。QQ 虚拟用户目录收到的文件访问仍会安全映射到该账号自己的本地 TSDK 数据目录。
 
-当前构建信息见 [2026-10-22 游戏版本与资源对齐](game-update-20261022.md)。微信环境探测与 ACEVM 仍存在 Node.js 宿主能力限制；版本和资源更新不代表动态检查已经通过。以下为历史验证记录。
+微信官方 `imports.a.o` 同时负责环境探测并写回结果，Node 目前没有实现，不能将它仅视作函数列表读取。相同合成输入下官方 JS 与 Node 的初始化凭据逐字节一致；与真实微信样本的剩余差异来自 SDK 自检位图，未通过改写位图消除。具体排查与边界见 [微信连接诊断](wechat-connection.md#微信宿主与初始化凭据进一步排查)。
+
+本轮 QQ 登录及心跳抓包确认 `1.17.0.4_20261117`。TSDK 版本字符串没有变化，但二进制及哈希已更新；初始化、既有合成凭据向量和请求体加解密回归通过，新会话的活动与场景请求可正常解密。
+
+微信第 82 版官方包的配置也确认为 `version=1.17.0.4`、`proto=20261117`。独立 WASM 的导入与导出兼容，初始化及多种长度请求体加解密往返通过；相同合成宿主输入下，Node 运行时与本次官方 JS 的初始化凭据完整一致（119 bytes）。本轮监听目录仅有 QQ 登录，未把这组离线校验当作微信账号连接实测。
+
+以下为历史验证记录。
 
 ## 2026-10-02 升级验证
 

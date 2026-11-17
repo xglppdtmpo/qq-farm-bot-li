@@ -16,11 +16,12 @@ const { autoBuyFertilizer, checkAndBuyFertilizerBoth, buyFreeGifts, getFreeGiftD
 const { performDailyMonthCardGift, getMonthCardDailyState } = require('../services/monthcard');
 const { performDailyVipGift, getVipDailyState } = require('../services/qqvip');
 const { runExclusiveAutomationTask } = require('../services/automation-lock');
+const ranchAutomation = require('../services/ranch/automation');
 const { createScheduler, getSchedulerRegistrySnapshot } = require('../services/scheduler');
 const { checkDailyShareStatus, getShareDailyState } = require('../services/share');
 const { refreshActivityWindows } = require('../services/activity-windows');
-const { createMilkTeaAutomation, isMilkTeaAutomationEnabled, MILK_TEA_CHECK_INTERVAL_MS } = require('../services/milk-tea-auto');
 const { createSolarCalendarAutomation, isSolarCalendarAutomationEnabled, SOLAR_CALENDAR_CHECK_INTERVAL_MS } = require('../services/solar-calendar-auto');
+const { startMugeTimer } = require('../services/muge-auto');
 const { resetSessionGains, recordOperation, initStatsWithPersistence, saveStats } = require('../services/stats');
 const { initStatusBar, setStatusPlatform, statusData } = require('../services/status');
 const { setRecordGoldExpHook } = require('../services/status');
@@ -33,7 +34,7 @@ const {
     openCharitySettlementGiftPacksSilently,
 } = require('../services/warehouse');
 const { checkAndClaimDogSkillGifts } = require('../services/dog-skill-gifts');
-const { isGatewayHealthyForBusiness, nextBusinessBackoffMs } = require('../utils/low-priority-gate');
+const { isGatewayHealthyForBusiness, isGatewayIdleForLowPriority, nextBusinessBackoffMs } = require('../utils/low-priority-gate');
 const { connect, cleanup, getWs, getUserState, networkEvents, getGatewayLoad } = require('../utils/network');
 const { loadProto } = require('../utils/proto');
 const { runWithRequestClass } = require('../utils/request-context');
@@ -48,10 +49,9 @@ interface WorkerRuntimeConfig {
 
 const workerConfig = CONFIG as WorkerRuntimeConfig;
 
-// 奶茶(30min)、节令(30min)、神秘商人(2h) 都在登录就绪那一刻注册，周期互为整数倍，
+// 节令(30min)、神秘商人(2h) 都在登录就绪那一刻注册，周期互为整数倍，
 // 所以每隔 2 小时必然在同一秒一起到期 —— 2026-10-22 那次掉线前的 peak=10/s 正好落在 T0+4h 整。
-// 偏移取对 30min 互不重合的分钟数（11 / 19 / 37 ≡ 11 / 19 / 7），之后任何一秒都只有一个任务到期。
-const MILK_TEA_CHECK_PHASE_MS = 11 * 60 * 1000;
+// 偏移取对 30min 互不重合的分钟数（19 / 37 ≡ 19 / 7），之后任何一秒都只有一个任务到期。
 const SOLAR_CALENDAR_CHECK_PHASE_MS = 19 * 60 * 1000;
 const MYSTERY_SHOP_CHECK_PHASE_MS = 37 * 60 * 1000;
 
@@ -116,12 +116,13 @@ let isRunning: boolean = false;
 let loginReady: boolean = false;
 let appliedConfigRevision: number = 0;
 let unifiedSchedulerRunning: boolean = false;
+let unifiedTickGeneration: number | null = null;
 let farmTaskRunning: boolean = false;
 let nextFarmRunAt: number = 0;
 let friendTaskRunning: boolean = false;
 let nextFriendRunAt: number = 0;
-// 网关卡住时两条定时任务各自的退避时长（毫秒），0 表示按正常间隔跑
-const businessBackoffMs: Record<string, number> = { farm: 0, friend: 0 };
+// 网关卡住时各定时任务的退避时长（毫秒），0 表示按正常间隔跑
+const businessBackoffMs: Record<string, number> = { farm: 0, friend: 0, ranch: 0 };
 let lastStatusHash: string = '';
 let lastStatusSentAt: number = 0;
 let onSellGain: ((deltaGold: any) => void) | null = null;
@@ -134,6 +135,54 @@ let wsErrorHandledAt: number = 0;
 let shutdownStarted: boolean = false;
 let runtimeGeneration: number = 0;
 let lastDailyRunDate: string = '';
+let ranchRoutineQueued = false;
+let initialFarmCheckDone = false;
+let initialFriendCheckDone = false;
+let ranchDeferredUntil = 0;
+let onRanchMarketStockReady: (() => void) | null = null;
+
+function ranchNextRunAt(): number {
+    // 首轮农场和好友巡查先完成；长好友轮次的访问间隔也不插入场景切换。
+    if (!unifiedSchedulerRunning || ranchRoutineQueued || farmTaskRunning || friendTaskRunning
+        || !initialFarmCheckDone || !initialFriendCheckDone) return Infinity;
+    const state = ranchAutomation.getRoutineState();
+    return state.doneToday ? Infinity : Math.max(state.nextCheckAt, ranchDeferredUntil);
+}
+
+function wakeRanchMarketExchange(): void {
+    if (!loginReady || !getAutomation().ranch_market_organic) return;
+    ranchAutomation.resetMarketSchedule();
+    scheduleUnifiedNextTick();
+}
+
+function runRanchRoutine(detached = false): Promise<void> {
+    if (!loginReady || Date.now() < ranchNextRunAt()) return Promise.resolve();
+    const generation = runtimeGeneration;
+    ranchRoutineQueued = true;
+    return runExclusiveAutomationTask('ranch_routine', async () => {
+        if (!loginReady || generation !== runtimeGeneration) return;
+        // 排队期间农场可能已到期，拿到锁后重新判断，避免空切一次牧场。
+        if (farmTaskRunning || friendTaskRunning || Date.now() >= Math.min(nextFarmRunAt, nextFriendRunAt)) return;
+        const deferMs = nextBusinessTickDeferMs('ranch');
+        if (deferMs > 0) {
+            ranchDeferredUntil = Date.now() + deferMs;
+            return;
+        }
+        if (!isGatewayIdleForLowPriority(getGatewayLoad())) {
+            ranchDeferredUntil = Date.now() + 1000;
+            return;
+        }
+        const state = ranchAutomation.getRoutineState();
+        if (state.doneToday || Date.now() < state.nextCheckAt) return;
+        await runWithRequestClass('friend', () => ranchAutomation.run({
+            farmDeadline: () => Math.min(nextFarmRunAt, friendTaskRunning ? Date.now() : nextFriendRunAt),
+            canContinue: () => loginReady && generation === runtimeGeneration && isGatewayHealthyForBusiness(getGatewayLoad()),
+        }));
+    }, { detached }).finally(() => {
+        ranchRoutineQueued = false;
+        scheduleUnifiedNextTick();
+    });
+}
 const workerScheduler = createScheduler('worker');
 
 async function runDailyRoutines(force: boolean = false): Promise<void> {
@@ -229,7 +278,7 @@ function resetUnifiedSchedule(): void {
     businessBackoffMs.friend = 0;
 }
 
-const BUSINESS_TICK_LABEL: Record<string, string> = { farm: '农场定时任务', friend: '好友定时任务' };
+const BUSINESS_TICK_LABEL: Record<string, string> = { farm: '农场定时任务', friend: '好友定时任务', ranch: '牧场定时任务' };
 
 function describeGatewayStall(load: any): string {
     const parts: string[] = [];
@@ -301,6 +350,7 @@ async function runFarmTick(auto: any): Promise<void> {
     } finally {
         nextFarmRunAt = Date.now() + farmMs;
         farmTaskRunning = false;
+        initialFarmCheckDone = true;
     }
 }
 
@@ -315,6 +365,7 @@ async function runFriendTick(auto: any): Promise<void> {
     // friend 总开关仍控制好友任务总入口；关闭时也要推进到期时间，避免调度器每秒空转。
     if (!auto.friend) {
         nextFriendRunAt = Date.now() + friendMs;
+        initialFriendCheckDone = true;
         return;
     }
 
@@ -335,6 +386,7 @@ async function runFriendTick(auto: any): Promise<void> {
         if (generation === runtimeGeneration) {
             nextFriendRunAt = Date.now() + friendMs;
             friendTaskRunning = false;
+            initialFriendCheckDone = true;
             scheduleUnifiedNextTick();
         }
     }
@@ -346,39 +398,51 @@ async function runUnifiedTick(): Promise<void> {
     const now = Date.now();
     const dueFarm = now >= nextFarmRunAt;
     const dueFriend = now >= nextFriendRunAt;
-    if (!dueFarm && !dueFriend) return;
+    if (!dueFarm && !dueFriend && now < ranchNextRunAt()) return;
 
     const auto = getAutomation();
     // 好友按单次访问持锁，等待间隔不阻塞后续农场巡查。
     if (dueFarm) await runExclusiveAutomationTask('farm_tick', () => runFarmTick(auto));
     if (!unifiedSchedulerRunning || !loginReady || generation !== runtimeGeneration) return;
     if (dueFriend && !friendTaskRunning) void runFriendTick(auto);
+    void runRanchRoutine(true).catch((error: any) => logWarn('牧场', `牧场例程失败：${error.message}`));
 }
 
 function scheduleUnifiedNextTick(): void {
     if (!unifiedSchedulerRunning) return;
+    // 牧场离场可提前唤醒，但正在等待连接的农场巡查不能再排一轮。
+    if (unifiedTickGeneration === runtimeGeneration) return;
     workerScheduler.clear('unified_next_tick');
     if (!loginReady) return;
 
     const now = Date.now();
     const nextAt = Math.min(
         farmTaskRunning ? Number.POSITIVE_INFINITY : (Number(nextFarmRunAt) || (now + 1000)),
-        friendTaskRunning ? Number.POSITIVE_INFINITY : (Number(nextFriendRunAt) || (now + 1000))
+        friendTaskRunning ? Number.POSITIVE_INFINITY : (Number(nextFriendRunAt) || (now + 1000)),
+        ranchNextRunAt(),
     );
     if (!Number.isFinite(nextAt)) return;
     const delayMs = Math.max(1000, nextAt - now); // 最低 1 秒
 
+    const generation = runtimeGeneration;
     workerScheduler.setTimeoutTask('unified_next_tick', delayMs, async () => {
+        if (generation !== runtimeGeneration || !unifiedSchedulerRunning || unifiedTickGeneration === generation) return;
+        unifiedTickGeneration = generation;
         try {
             await runUnifiedTick();
         } finally {
-            scheduleUnifiedNextTick();
+            if (unifiedTickGeneration === generation) unifiedTickGeneration = null;
+            if (generation === runtimeGeneration) scheduleUnifiedNextTick();
         }
     });
 }
 
 function startUnifiedScheduler(): void {
     if (unifiedSchedulerRunning) return;
+    initialFarmCheckDone = false;
+    initialFriendCheckDone = false;
+    ranchDeferredUntil = 0;
+    businessBackoffMs.ranch = 0;
     unifiedSchedulerRunning = true;
     resetUnifiedSchedule();
     scheduleUnifiedNextTick();
@@ -431,8 +495,8 @@ async function runStartupSequence(canContinue: () => boolean = () => loginReady)
         startUnifiedScheduler();
         startDailyRoutineTimer(false);
         startMysteryShopTimer();
-        startMilkTeaActivityTimer();
         startSolarCalendarTimer();
+        startMugeTimer(workerScheduler, () => loginReady);
     } catch (e: any) {
         log('系统', `登录启动序列执行失败: ${e.message}`, { module: 'system', event: '启动序列', result: 'error' });
     }
@@ -462,65 +526,6 @@ function startMysteryShopTimer(): void {
     workerScheduler.setIntervalTask('mystery_shop_interval', AUTO_BUY_CHECK_INTERVAL_MS, () => {
         runExclusiveAutomationTask('mystery_shop', runMysteryShopTick).catch(() => null);
     }, { phaseMs: MYSTERY_SHOP_CHECK_PHASE_MS });
-}
-
-let milkTeaAutomation: any = null;
-
-async function runMilkTeaTick(): Promise<void> {
-    if (!loginReady) return;
-    const automation = getAutomation() || {};
-    if (!isMilkTeaAutomationEnabled(automation)) return;
-    if (!milkTeaAutomation) {
-        const { getMilkTeaActivity, operateMilkTeaActivity } = require('../services/milk-tea');
-        const { getShareRewardActivity, operateShareRewardActivity } = require('../services/share-reward-activity');
-        const { getServerTimeSec } = require('../utils/utils');
-        milkTeaAutomation = createMilkTeaAutomation({
-            getMilkTeaActivity,
-            operateMilkTeaActivity,
-            getShareRewardActivity,
-            operateShareRewardActivity,
-            getServerTimeSec,
-            log,
-        });
-    }
-    try {
-        await milkTeaAutomation.runMilkTeaAutomation({
-            claimRewards: automation.milk_tea_claim_rewards === true,
-            claimWages: automation.milk_tea_claim_wages === true,
-            claimFund: automation.milk_tea_claim_fund === true,
-            happyDaily: automation.milk_tea_happy_daily === true,
-            happyShare: automation.milk_tea_happy_share === true,
-            happyMilestones: automation.milk_tea_happy_milestones === true,
-            craft: automation.milk_tea_craft === true,
-            hire: automation.milk_tea_hire === true,
-            upgrade: automation.milk_tea_upgrade === true,
-            boost: automation.milk_tea_boost === true,
-            workInteract: automation.milk_tea_work_interact === true,
-            // 雇佣的三个选法配置。机器人候选在老配置里可能还没有这个 key，缺省按默认（开）处理，
-            // 时长和特长由 milk-tea-auto 自己夹回合法档，非法值只会退回默认，不会报个服务端不认的档。
-            hireDurationId: automation.milk_tea_hire_duration_id,
-            hireTalentId: automation.milk_tea_hire_talent_id,
-            hireAllowRobots: automation.milk_tea_hire_allow_robots !== false,
-        });
-    } catch (e: any) {
-        log('活动', `奶茶自动任务失败: ${e.message}`, { module: 'activity', event: '奶茶活动自动', result: 'error' });
-    }
-}
-
-function stopMilkTeaActivityTimer(): void {
-    workerScheduler.clear('milk_tea_initial');
-    workerScheduler.clear('milk_tea_interval');
-}
-
-function startMilkTeaActivityTimer(): void {
-    stopMilkTeaActivityTimer();
-    if (!loginReady || !isMilkTeaAutomationEnabled(getAutomation())) return;
-    workerScheduler.setTimeoutTask('milk_tea_initial', 90000, () => {
-        runExclusiveAutomationTask('milk_tea', runMilkTeaTick).catch(() => null);
-    });
-    workerScheduler.setIntervalTask('milk_tea_interval', MILK_TEA_CHECK_INTERVAL_MS, () => {
-        runExclusiveAutomationTask('milk_tea', runMilkTeaTick).catch(() => null);
-    }, { phaseMs: MILK_TEA_CHECK_PHASE_MS });
 }
 
 let solarCalendarAutomation: any = null;
@@ -593,6 +598,8 @@ function applyRuntimeConfig(snapshot: any, syncNow: boolean = false): number {
     }
     const appliedSnapshot = applyConfigSnapshot(snapshot || {}, { persist: false, accountId });
     configureEmailClaim({ hour: appliedSnapshot.emailClaimHour, accountId });
+    const nextRanchAuto = getAutomation();
+    if (Object.keys(nextRanchAuto).some(key => key.startsWith('ranch_') && nextRanchAuto[key] !== prevAuto[key])) ranchAutomation.resetSchedule();
     if (rev > appliedConfigRevision) appliedConfigRevision = rev;
 
     // 优先使用本次下发的间隔，避免 worker 内部 store 漂移导致回退默认值
@@ -632,8 +639,8 @@ function applyRuntimeConfig(snapshot: any, syncNow: boolean = false): number {
             }
 
             startMysteryShopTimer();
-            startMilkTeaActivityTimer();
             startSolarCalendarTimer();
+            startMugeTimer(workerScheduler, () => loginReady);
         }
     }
 
@@ -761,6 +768,10 @@ async function startBot(config: any): Promise<void> {
         };
         networkEvents.on('farmHarvested', onFarmHarvested);
 
+        if (onRanchMarketStockReady) networkEvents.off('ranchMarketStockReady', onRanchMarketStockReady);
+        onRanchMarketStockReady = wakeRanchMarketExchange;
+        networkEvents.on('ranchMarketStockReady', onRanchMarketStockReady);
+
         if (onDogSkillGiftPending) {
             networkEvents.off('dogSkillGiftPending', onDogSkillGiftPending);
         }
@@ -842,6 +853,10 @@ function detachRuntimeListeners(): void {
         networkEvents.off('farmHarvested', onFarmHarvested);
         onFarmHarvested = null;
     }
+    if (onRanchMarketStockReady) {
+        networkEvents.off('ranchMarketStockReady', onRanchMarketStockReady);
+        onRanchMarketStockReady = null;
+    }
     if (onDogSkillGiftPending) {
         networkEvents.off('dogSkillGiftPending', onDogSkillGiftPending);
         onDogSkillGiftPending = null;
@@ -922,325 +937,346 @@ async function handleApiCall(msg: any): Promise<void> {
             if (!isRunning || shutdownStarted || !loginReady) {
                 throw new Error('账号未连接');
             }
-            switch (method) {
-            case 'getLands':
-                result = await getLandsDetail(args[0] === true);
-                break;
-            case 'getIllustratedSnapshot':
-                result = await require('../services/illustrated').getIllustratedSnapshot();
-                break;
-            case 'getCollectionsSnapshot':
-                result = await require('../services/collections').getCollectionsSnapshot();
-                break;
-            case 'operateCollections':
-                result = await require('../services/collections').operateCollections(args[0], args[1]);
-                break;
-            case 'claimIllustratedRewards':
-                result = await require('../services/illustrated').claimIllustratedRewards(args[0]);
-                break;
-            case 'getSolarCalendar':
-                result = await require('../services/solar-calendar').getSolarCalendar();
-                break;
-            case 'operateSolarCalendar':
-                result = await require('../services/solar-calendar').operateSolarCalendar(args[0], args[1]);
-                break;
-            case 'getFriends':
-                result = await getFriendsList(args[0] === true, 'normal', args[1] === true);
-                break;
-            case 'getFriendsCache':
-                result = getFriendsListCacheOnly();
-                break;
-            case 'clearFriendsCache':
-                require('../services/friend').clearFriendsListCache();
-                result = { ok: true };
-                break;
-            case 'getInteractRecords':
-                result = await getInteractRecords();
-                break;
-            case 'getFriendLands':
-                result = await getFriendLandsDetail(args[0], args[1] === true);
-                break;
-            case 'getFriendInteractionItems':
-                result = await require('../services/friend-interaction-items').getFriendInteractionItems(args[0] === true);
-                break;
-            case 'useFriendInteractionItemBatch':
-                result = await require('../services/friend-interaction-items').useFriendInteractionItemBatch(args[0], args[1], args[2], args[3] === true);
-                break;
-            case 'useFriendFarmInteractionItem':
-                result = await require('../services/friend-interaction-items').useFriendFarmInteractionItem(args[0], args[1], args[2] === true);
-                break;
-            case 'getSelfInteractionItems':
-                result = await require('../services/friend-interaction-items').getSelfInteractionItems(args[0] === true);
-                break;
-            case 'useSelfInteractionItemBatch':
-                result = await require('../services/friend-interaction-items').useSelfInteractionItemBatch(args[0], args[1], args[2] === true);
-                break;
-            case 'doFriendOp':
-                result = await doFriendOperation(args[0], args[1], args[2] === true);
-                break;
-            case 'delFriend':
-                result = await deleteFriend(args[0]);
-                break;
-            case 'getSeeds':
-                result = await getAvailableSeeds(args[0] === true);
-                break;
-            case 'purchaseSeed':
-                result = await purchaseSeed(args[0], args[1]);
-                break;
-            case 'getBag':
-                result = await require('../services/warehouse').getBagDetail();
-                break;
-            case 'getBagSeeds':
-                result = await require('../services/warehouse').getBagSeeds();
-                break;
-            case 'getDiamondBalance':
-                result = await require('../services/pay').getDiamondBalance();
-                break;
-            case 'useItem': {
-                const { useItem: _useItem } = require('../services/warehouse');
-                const itemId = Number(args[0]) || 0;
-                const count = Math.max(1, Number(args[1]) || 1);
-                const uid = Number(args[2]) || 0;
-                result = await _useItem(itemId, count, [], uid);
-                break;
-            }
-            case 'sellItems': {
-                const { sellItems: _sell } = require('../services/warehouse');
-                const sellList = Array.isArray(args[0]) ? args[0] : [];
-                result = await _sell(sellList.map((it: any) => ({
-                    id: it.id,
-                    count: it.count,
-                    uid: it.uid || 0,
-                    expire_time: it.expireTime ?? it.expire_time,
-                })));
-                break;
-            }
-            case 'setItemsLocked':
-                result = await require('../services/warehouse').setItemsLocked(args[0], args[1] === true);
-                break;
-            case 'getDogSkillGiftStatus': {
-                const dogGifts = require('../services/dog-skill-gifts');
-                const info = await dogGifts.getDogInfo();
-                result = { pendingCount: dogGifts.getPendingGiftCount(info) };
-                break;
-            }
-            case 'claimDogSkillGifts':
-                result = await require('../services/dog-skill-gifts').checkAndClaimDogSkillGifts(undefined, true);
-                break;
-            case 'getPetInfo':
-                result = await require('../services/pets').getPetInfo();
-                break;
-            case 'activateDog':
-                result = await require('../services/pets').activateDog(args[0]);
-                break;
-            case 'deployDog':
-                result = await require('../services/pets').deployDog(args[0]);
-                break;
-            case 'withdrawDog':
-                result = await require('../services/pets').withdrawDog();
-                break;
-            case 'useDogFood':
-                result = await require('../services/pets').useDogFood(args[0], args[1], args[2]);
-                break;
-            case 'getPetProtectLogs':
-                result = await require('../services/pets').getProtectLogs();
-                break;
-            case 'setAutomation': {
-                const payload = args && args[0] ? args[0] : {};
-                applyRuntimeConfig({ automation: { [payload.key]: payload.value } }, true);
-                result = getAutomation();
-                break;
-            }
-            case 'doFarmOp':
-                result = await runFarmOperation(args[0], args[1], args[2] === true); // opType, optional targetLandId
-                break;
-            case 'fertilizeOwnLand':
-                result = await fertilizeOwnLand(args[0], args[1]);
-                break;
-            case 'fertilizeAllOwnLands':
-                result = await require('../services/farm').fertilizeAllOwnLands(args[0], args[1]);
-                break;
-            case 'buyFertilizer': {
-                const fertilizerType = args[0] || 'organic';
-                const fertilizerCount = Number(args[1]) || 0;
-                result = await autoBuyFertilizer(true, fertilizerType, fertilizerCount, args[2] === true);
-                break;
-            }
-            case 'checkAndBuyFertilizer': {
-                const options = args[0] || {};
-                result = await checkAndBuyFertilizerBoth(options, args[1] === true);
-                break;
-            }
-            case 'getAnalytics': {
-                const { getPlantRankings } = require('../services/analytics');
-                result = getPlantRankings(args[0]); // sortBy
-                break;
-            }
-            case 'getDailyGiftOverview':
-                result = await getDailyGiftOverview(args[0] === true);
-                break;
-            case 'getActivityDirectorySnapshot':
-                result = await require('../services/activity-center').getActivityDirectorySnapshot();
-                break;
-            case 'getActivityCenterSnapshot':
-                result = await require('../services/activity-center').getActivityCenterSnapshot();
-                break;
-            case 'getCurrentSeasonEvent':
-                result = await require('../services/activity-center').getCurrentSeasonEvent();
-                break;
-            case 'getCurrentStellarActivity':
-                result = await require('../services/activity-center').getCurrentStellarActivity();
-                break;
-            case 'getCurrentStarSandShop':
-                result = await require('../services/activity-center').getCurrentStarSandShop();
-                break;
-            case 'getCurrentSolarTerms':
-                result = await require('../services/activity-center').getCurrentSolarTerms();
-                break;
-            case 'getCurrentQixiActivity':
-                result = await require('../services/activity-center').getCurrentQixiActivity();
-                break;
-            case 'getCurrentCharityRedFlowerActivity':
-                result = await require('../services/activity-center').getCurrentCharityRedFlowerActivity();
-                break;
-            case 'getPetDiary':
-                result = await require('../services/activity-center').getPetDiary();
-                break;
-            case 'operatePetDiary':
-                result = await require('../services/activity-center').operatePetDiary(args[0], args[1]);
-                break;
-            case 'getPetDiaryRecords':
-                result = await require('../services/activity-center').getPetDiaryRecords(args[0]);
-                break;
-            case 'getPetDiaryFriend':
-                result = await require('../services/activity-center').getPetDiaryFriend(args[0]);
-                break;
-            case 'claimCharityRedFlowerSeeds':
-                result = await require('../services/activity-center').claimCharityRedFlowerSeeds();
-                break;
-            case 'donateCharityRedFlowerLove':
-                result = await require('../services/activity-center').donateCharityRedFlowerLove();
-                break;
-            case 'claimCharityRedFlowerDailyGift':
-                result = await require('../services/activity-center').claimCharityRedFlowerDailyGift();
-                break;
-            case 'claimCharityRedFlowerProgressReward':
-                result = await require('../services/activity-center').claimCharityRedFlowerProgressReward(args[0]);
-                break;
-            case 'getCurrentWeatherActivity':
-                result = await require('../services/activity-center').getCurrentWeatherActivity();
-                break;
-            case 'buyWeatherBottle':
-                result = await require('../services/activity-center').buyWeatherBottle(args[0]);
-                break;
-            case 'collectWeatherBottle':
-                result = await require('../services/activity-center').collectWeatherBottle(args[0]);
-                break;
-            case 'lightWeatherResearch':
-                result = await require('../services/activity-center').lightWeatherResearch(args[0]);
-                break;
-            case 'summonWeatherRain':
-                result = await require('../services/activity-center').summonWeatherRain();
-                break;
-            case 'claimBattlePassRewards':
-                result = await require('../services/activity-center').claimBattlePassRewards();
-                break;
-            case 'exchangeStarSandGoods':
-                result = await require('../services/activity-center').exchangeStarSandGoods(args[0], args[1]);
-                break;
-            case 'lightConstellation':
-                result = await require('../services/activity-center').lightConstellation();
-                break;
-            case 'claimSolarTerm':
-                result = await require('../services/activity-center').claimSolarTerm(String(args[0] || ''));
-                break;
-            case 'getCurrentQingMeiActivity':
-                result = await require('../services/activity-center').getCurrentQingMeiActivity();
-                break;
-            case 'claimQingMeiDailySeed':
-                result = await require('../services/activity-center').claimQingMeiDailySeed();
-                break;
-            case 'startQingMeiBrew':
-                result = await require('../services/activity-center').startQingMeiBrew(args[0]);
-                break;
-            case 'continueQingMeiBrew':
-                result = await require('../services/activity-center').continueQingMeiBrew();
-                break;
-            case 'settleQingMeiBrew':
-                result = await require('../services/activity-center').settleQingMeiBrew();
-                break;
-            case 'claimQixiBridgeRewards':
-                result = await require('../services/activity-center').claimQixiBridgeRewards();
-                break;
-            case 'giftQixiSachet':
-                result = await require('../services/activity-center').giftQixiSachet(args[0], args[1]);
-                break;
-            case 'exchangeWeatherCollectorBottle':
-                result = await require('../services/activity-center').exchangeWeatherCollectorBottle();
-                break;
-            case 'getWeatherFriends':
-                result = await require('../services/activity-center').getWeatherFriends();
-                break;
-            case 'scanWeatherFriends':
-                result = await require('../services/activity-center').scanWeatherFriends(args[0]);
-                break;
-            case 'useWeatherCollectorBottle':
-                result = await require('../services/activity-center').useWeatherCollectorBottle(args[0]);
-                break;
-            case 'useWeatherSummonBottle':
-                result = await require('../services/activity-center').useWeatherSummonBottle();
-                break;
-            case 'useWeatherFrogBottle':
-                result = await require('../services/activity-center').useWeatherFrogBottle(args[0]);
-                break;
-            case 'useWeatherCloudBottle':
-                result = await require('../services/activity-center').useWeatherCloudBottle(args[0], args[1]);
-                break;
-            case 'advanceWeatherResearch':
-                result = await require('../services/activity-center').advanceWeatherResearch(args[0]);
-                break;
-            case 'getAutumnActivity':
-                result = await require('../services/autumn-activities').getAutumnActivity(args[0]);
-                break;
-            case 'getMilkTeaActivity':
-                result = await require('../services/milk-tea').getMilkTeaActivity(args[0], args[1]);
-                break;
-            case 'operateMilkTeaActivity':
-                result = await require('../services/milk-tea').operateMilkTeaActivity(args[0], args[1]);
-                break;
-            case 'getShareRewardActivity':
-                result = await require('../services/share-reward-activity').getShareRewardActivity(args[0]);
-                break;
-            case 'operateShareRewardActivity':
-                result = await require('../services/share-reward-activity').operateShareRewardActivity(args[0], args[1], args[2]);
-                break;
-            case 'operateAutumnActivity':
-                result = await require('../services/autumn-activities').operateAutumnActivity(args[0], args[1], args[2]);
-                break;
-            case 'getPropsShop':
-                result = await require('../services/commerce').getPropsShop();
-                break;
-            case 'purchaseProps':
-                result = await require('../services/commerce').purchaseProps(args[0], args[1], args[2]);
-                break;
-            case 'getMallCatalog':
-                result = await require('../services/commerce').getMallCatalog(args[0], args[1]);
-                break;
-            case 'purchaseMallProduct':
-                result = await require('../services/commerce').purchaseMallProduct(args[0], args[1], args[2], args[3]);
-                break;
-            case 'getMysteryShop':
-                result = await require('../services/commerce').getMysteryShop();
-                break;
-            case 'purchaseMysteryOffer':
-                result = await require('../services/commerce').purchaseMysteryOffer(args[0]);
-                break;
-            case 'getSchedulers':
-                result = getSchedulerRegistrySnapshot();
-                break;
-            default:
-                error = 'Unknown method';
-            }
+            await runExclusiveAutomationTask(`api:${method}`, async () => {
+                if (!loginReady || shutdownStarted) throw new Error('账号未连接');
+                switch (method) {
+                case 'getRanchState':
+                    result = await require('../services/ranch').getRanchState(args[0], args[1], args[2]);
+                    break;
+                case 'prepareRanchAction':
+                    result = await require('../services/ranch').prepareRanchAction(args[0], args[1]);
+                    break;
+                case 'operateRanch':
+                    result = await require('../services/ranch').operateRanch(args[0], args[1]);
+                    break;
+                case 'getLands':
+                    result = await getLandsDetail(args[0] === true);
+                    break;
+                case 'getIllustratedSnapshot':
+                    result = await require('../services/illustrated').getIllustratedSnapshot();
+                    break;
+                case 'getCollectionsSnapshot':
+                    result = await require('../services/collections').getCollectionsSnapshot();
+                    break;
+                case 'operateCollections':
+                    result = await require('../services/collections').operateCollections(args[0], args[1]);
+                    break;
+                case 'claimIllustratedRewards':
+                    result = await require('../services/illustrated').claimIllustratedRewards(args[0]);
+                    break;
+                case 'getSolarCalendar':
+                    result = await require('../services/solar-calendar').getSolarCalendar();
+                    break;
+                case 'operateSolarCalendar':
+                    result = await require('../services/solar-calendar').operateSolarCalendar(args[0], args[1]);
+                    break;
+                case 'getFriends':
+                    result = await getFriendsList(args[0] === true, 'normal', args[1] === true);
+                    break;
+                case 'getFriendsCache':
+                    result = getFriendsListCacheOnly();
+                    break;
+                case 'clearFriendsCache':
+                    require('../services/friend').clearFriendsListCache();
+                    result = { ok: true };
+                    break;
+                case 'getInteractRecords':
+                    result = await getInteractRecords();
+                    break;
+                case 'getFriendLands':
+                    result = await getFriendLandsDetail(args[0], args[1] === true);
+                    break;
+                case 'getFriendInteractionItems':
+                    result = await require('../services/friend-interaction-items').getFriendInteractionItems(args[0] === true);
+                    break;
+                case 'useFriendInteractionItemBatch':
+                    result = await require('../services/friend-interaction-items').useFriendInteractionItemBatch(args[0], args[1], args[2], args[3] === true);
+                    break;
+                case 'useFriendFarmInteractionItem':
+                    result = await require('../services/friend-interaction-items').useFriendFarmInteractionItem(args[0], args[1], args[2] === true);
+                    break;
+                case 'getSelfInteractionItems':
+                    result = await require('../services/friend-interaction-items').getSelfInteractionItems(args[0] === true);
+                    break;
+                case 'useSelfInteractionItemBatch':
+                    result = await require('../services/friend-interaction-items').useSelfInteractionItemBatch(args[0], args[1], args[2] === true);
+                    break;
+                case 'doFriendOp':
+                    result = await doFriendOperation(args[0], args[1], args[2] === true);
+                    break;
+                case 'delFriend':
+                    result = await deleteFriend(args[0]);
+                    break;
+                case 'getSeeds':
+                    result = await getAvailableSeeds(args[0] === true);
+                    break;
+                case 'purchaseSeed':
+                    result = await purchaseSeed(args[0], args[1]);
+                    break;
+                case 'getBag':
+                    result = await require('../services/warehouse').getBagDetail();
+                    break;
+                case 'getBagSeeds':
+                    result = await require('../services/warehouse').getBagSeeds();
+                    break;
+                case 'getDiamondBalance':
+                    result = await require('../services/pay').getDiamondBalance();
+                    break;
+                case 'useItem': {
+                    const { useItem: _useItem } = require('../services/warehouse');
+                    const itemId = Number(args[0]) || 0;
+                    const count = Math.max(1, Number(args[1]) || 1);
+                    const uid = Number(args[2]) || 0;
+                    result = await _useItem(itemId, count, [], uid);
+                    break;
+                }
+                case 'sellItems': {
+                    const { sellItems: _sell } = require('../services/warehouse');
+                    const sellList = Array.isArray(args[0]) ? args[0] : [];
+                    result = await _sell(sellList.map((it: any) => ({
+                        id: it.id,
+                        count: it.count,
+                        uid: it.uid || 0,
+                        expire_time: it.expireTime ?? it.expire_time,
+                    })));
+                    break;
+                }
+                case 'setItemsLocked':
+                    result = await require('../services/warehouse').setItemsLocked(args[0], args[1] === true);
+                    break;
+                case 'getDogSkillGiftStatus': {
+                    const dogGifts = require('../services/dog-skill-gifts');
+                    const info = await dogGifts.getDogInfo();
+                    result = { pendingCount: dogGifts.getPendingGiftCount(info) };
+                    break;
+                }
+                case 'claimDogSkillGifts':
+                    result = await require('../services/dog-skill-gifts').checkAndClaimDogSkillGifts(undefined, true);
+                    break;
+                case 'getPetInfo':
+                    result = await require('../services/pets').getPetInfo();
+                    break;
+                case 'activateDog':
+                    result = await require('../services/pets').activateDog(args[0]);
+                    break;
+                case 'deployDog':
+                    result = await require('../services/pets').deployDog(args[0]);
+                    break;
+                case 'withdrawDog':
+                    result = await require('../services/pets').withdrawDog();
+                    break;
+                case 'useDogFood':
+                    result = await require('../services/pets').useDogFood(args[0], args[1], args[2]);
+                    break;
+                case 'getPetProtectLogs':
+                    result = await require('../services/pets').getProtectLogs();
+                    break;
+                case 'setAutomation': {
+                    const payload = args && args[0] ? args[0] : {};
+                    applyRuntimeConfig({ automation: { [payload.key]: payload.value } }, true);
+                    result = getAutomation();
+                    break;
+                }
+                case 'doFarmOp':
+                    result = await runFarmOperation(args[0], args[1], args[2] === true); // opType, optional targetLandId
+                    break;
+                case 'fertilizeOwnLand':
+                    result = await fertilizeOwnLand(args[0], args[1]);
+                    break;
+                case 'fertilizeAllOwnLands':
+                    result = await require('../services/farm').fertilizeAllOwnLands(args[0], args[1]);
+                    break;
+                case 'buyFertilizer': {
+                    const fertilizerType = args[0] || 'organic';
+                    const fertilizerCount = Number(args[1]) || 0;
+                    result = await autoBuyFertilizer(true, fertilizerType, fertilizerCount, args[2] === true);
+                    break;
+                }
+                case 'checkAndBuyFertilizer': {
+                    const options = args[0] || {};
+                    result = await checkAndBuyFertilizerBoth(options, args[1] === true);
+                    break;
+                }
+                case 'getAnalytics': {
+                    const { getPlantRankings } = require('../services/analytics');
+                    result = getPlantRankings(args[0]); // sortBy
+                    break;
+                }
+                case 'getDailyGiftOverview':
+                    result = await getDailyGiftOverview(args[0] === true);
+                    break;
+                case 'getRanchActivityDirectorySnapshot':
+                    result = await require('../services/activity-center').getRanchActivityDirectorySnapshot();
+                    break;
+                case 'getActivityDirectorySnapshot':
+                    result = await require('../services/activity-center').getActivityDirectorySnapshot();
+                    break;
+                case 'getActivityCenterSnapshot':
+                    result = await require('../services/activity-center').getActivityCenterSnapshot();
+                    break;
+                case 'getCurrentSeasonEvent':
+                    result = await require('../services/activity-center').getCurrentSeasonEvent();
+                    break;
+                case 'getCurrentStellarActivity':
+                    result = await require('../services/activity-center').getCurrentStellarActivity();
+                    break;
+                case 'getCurrentStarSandShop':
+                    result = await require('../services/activity-center').getCurrentStarSandShop();
+                    break;
+                case 'getCurrentSolarTerms':
+                    result = await require('../services/activity-center').getCurrentSolarTerms();
+                    break;
+                case 'getCurrentQixiActivity':
+                    result = await require('../services/activity-center').getCurrentQixiActivity();
+                    break;
+                case 'getCurrentCharityRedFlowerActivity':
+                    result = await require('../services/activity-center').getCurrentCharityRedFlowerActivity();
+                    break;
+                case 'getPetDiary':
+                    result = await require('../services/activity-center').getPetDiary();
+                    break;
+                case 'operatePetDiary':
+                    result = await require('../services/activity-center').operatePetDiary(args[0], args[1]);
+                    break;
+                case 'getPetDiaryRecords':
+                    result = await require('../services/activity-center').getPetDiaryRecords(args[0]);
+                    break;
+                case 'getPetDiaryFriend':
+                    result = await require('../services/activity-center').getPetDiaryFriend(args[0]);
+                    break;
+                case 'claimCharityRedFlowerSeeds':
+                    result = await require('../services/activity-center').claimCharityRedFlowerSeeds();
+                    break;
+                case 'donateCharityRedFlowerLove':
+                    result = await require('../services/activity-center').donateCharityRedFlowerLove();
+                    break;
+                case 'claimCharityRedFlowerDailyGift':
+                    result = await require('../services/activity-center').claimCharityRedFlowerDailyGift();
+                    break;
+                case 'claimCharityRedFlowerProgressReward':
+                    result = await require('../services/activity-center').claimCharityRedFlowerProgressReward(args[0]);
+                    break;
+                case 'getCurrentWeatherActivity':
+                    result = await require('../services/activity-center').getCurrentWeatherActivity();
+                    break;
+                case 'buyWeatherBottle':
+                    result = await require('../services/activity-center').buyWeatherBottle(args[0]);
+                    break;
+                case 'collectWeatherBottle':
+                    result = await require('../services/activity-center').collectWeatherBottle(args[0]);
+                    break;
+                case 'lightWeatherResearch':
+                    result = await require('../services/activity-center').lightWeatherResearch(args[0]);
+                    break;
+                case 'summonWeatherRain':
+                    result = await require('../services/activity-center').summonWeatherRain();
+                    break;
+                case 'claimBattlePassRewards':
+                    result = await require('../services/activity-center').claimBattlePassRewards();
+                    break;
+                case 'exchangeStarSandGoods':
+                    result = await require('../services/activity-center').exchangeStarSandGoods(args[0], args[1]);
+                    break;
+                case 'lightConstellation':
+                    result = await require('../services/activity-center').lightConstellation();
+                    break;
+                case 'claimSolarTerm':
+                    result = await require('../services/activity-center').claimSolarTerm(String(args[0] || ''));
+                    break;
+                case 'getCurrentQingMeiActivity':
+                    result = await require('../services/activity-center').getCurrentQingMeiActivity();
+                    break;
+                case 'claimQingMeiDailySeed':
+                    result = await require('../services/activity-center').claimQingMeiDailySeed();
+                    break;
+                case 'startQingMeiBrew':
+                    result = await require('../services/activity-center').startQingMeiBrew(args[0]);
+                    break;
+                case 'continueQingMeiBrew':
+                    result = await require('../services/activity-center').continueQingMeiBrew();
+                    break;
+                case 'settleQingMeiBrew':
+                    result = await require('../services/activity-center').settleQingMeiBrew();
+                    break;
+                case 'claimQixiBridgeRewards':
+                    result = await require('../services/activity-center').claimQixiBridgeRewards();
+                    break;
+                case 'giftQixiSachet':
+                    result = await require('../services/activity-center').giftQixiSachet(args[0], args[1]);
+                    break;
+                case 'exchangeWeatherCollectorBottle':
+                    result = await require('../services/activity-center').exchangeWeatherCollectorBottle();
+                    break;
+                case 'getWeatherFriends':
+                    result = await require('../services/activity-center').getWeatherFriends();
+                    break;
+                case 'scanWeatherFriends':
+                    result = await require('../services/activity-center').scanWeatherFriends(args[0]);
+                    break;
+                case 'useWeatherCollectorBottle':
+                    result = await require('../services/activity-center').useWeatherCollectorBottle(args[0]);
+                    break;
+                case 'useWeatherSummonBottle':
+                    result = await require('../services/activity-center').useWeatherSummonBottle();
+                    break;
+                case 'useWeatherFrogBottle':
+                    result = await require('../services/activity-center').useWeatherFrogBottle(args[0]);
+                    break;
+                case 'useWeatherCloudBottle':
+                    result = await require('../services/activity-center').useWeatherCloudBottle(args[0], args[1]);
+                    break;
+                case 'advanceWeatherResearch':
+                    result = await require('../services/activity-center').advanceWeatherResearch(args[0]);
+                    break;
+                case 'getAutumnActivity':
+                    result = await require('../services/autumn-activities').getAutumnActivity(args[0]);
+                    break;
+                case 'getMugeActivity':
+                    result = await require('../services/muge-activity').getMugeActivity();
+                    break;
+                case 'operateMugeActivity':
+                    result = await require('../services/muge-activity').operateMugeActivity(args[0], args[1]);
+                    break;
+                case 'getMilkTeaActivity':
+                    result = await require('../services/milk-tea').getMilkTeaActivity(args[0], args[1]);
+                    break;
+                case 'operateMilkTeaActivity':
+                    result = await require('../services/milk-tea').operateMilkTeaActivity(args[0], args[1]);
+                    break;
+                case 'getShareRewardActivity':
+                    result = await require('../services/share-reward-activity').getShareRewardActivity(args[0]);
+                    break;
+                case 'operateShareRewardActivity':
+                    result = await require('../services/share-reward-activity').operateShareRewardActivity(args[0], args[1], args[2]);
+                    break;
+                case 'operateAutumnActivity':
+                    result = await require('../services/autumn-activities').operateAutumnActivity(args[0], args[1], args[2]);
+                    break;
+                case 'getPropsShop':
+                    result = await require('../services/commerce').getPropsShop();
+                    break;
+                case 'purchaseProps':
+                    result = await require('../services/commerce').purchaseProps(args[0], args[1], args[2]);
+                    break;
+                case 'getMallCatalog':
+                    result = await require('../services/commerce').getMallCatalog(args[0], args[1]);
+                    break;
+                case 'purchaseMallProduct':
+                    result = await require('../services/commerce').purchaseMallProduct(args[0], args[1], args[2], args[3]);
+                    break;
+                case 'getMysteryShop':
+                    result = await require('../services/commerce').getMysteryShop();
+                    break;
+                case 'purchaseMysteryOffer':
+                    result = await require('../services/commerce').purchaseMysteryOffer(args[0]);
+                    break;
+                case 'getSchedulers':
+                    result = getSchedulerRegistrySnapshot();
+                    break;
+                default:
+                    error = 'Unknown method';
+                }
+            });
         }
     } catch (e: any) {
         error = {
@@ -1280,6 +1316,7 @@ async function getDailyGiftOverview(propagateErrors: boolean = false): Promise<a
             currentTask: growthTask.currentTask || null,
             tasks: Array.isArray(growthTask.tasks) ? growthTask.tasks : [],
         },
+        ranch: require('../services/ranch/daily').getOverview(!!auto.ranch_task, !!auto.ranch_share, !!auto.ranch_daily_benefit),
         gifts: [
             {
                 key: 'task_claim',
