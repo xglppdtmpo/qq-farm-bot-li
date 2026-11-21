@@ -433,6 +433,9 @@ async function runFarmOperation(
                         count: targets.length,
                         landIds: targets,
                     });
+// 施肥前拿到的最新地块直接复用，省掉一次 AllLands；
+                    // 同时清空快照，让后续催熟重新拉取施肥后的状态，别用过期地块。
+                    fertilizerSnapshot = undefined;
                     const result = await runFertilizerByConfig(targets, { reason: 'multi_season', propagateErrors, lands: latestLands });
                     if (result.normal > 0) actions.push(`补肥${result.normal}`);
                     fertilizerSnapshot = undefined;

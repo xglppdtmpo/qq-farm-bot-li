@@ -30,6 +30,8 @@ withDefaults(defineProps<{
   /** 页面级统一保存时隐藏表单自带的底部按钮。 */
   hideSave?: boolean
   ranchAnimalOptions?: Array<{ value: number, label: string, kind: string }>
+  ranchAnimalOptionsLoading?: boolean
+  ranchAnimalOptionsError?: string
   accountId?: string
   connected?: boolean
   saving: boolean
@@ -39,20 +41,22 @@ withDefaults(defineProps<{
 
 const emit = defineEmits<{
   save: []
+  reloadAnimals: []
 }>()
 
 const settings = defineModel<AutomationSettingsFormModel>({ required: true })
 const ripeningOnly = computed(() => ['normal_ripen', 'organic_ripen'].includes(settings.value.automation.fertilizer ?? 'none'))
 const ripeningEnabled = computed(() => ripeningOnly.value || settings.value.automation.fertilizer === 'smart')
 const ripeningFertilizerLabel = computed(() => settings.value.automation.fertilizer === 'normal_ripen' ? '普通化肥' : '有机化肥')
-
 const ranchSwitches = [
   ['ranch_harvest', '自动收获'],
   ['ranch_produce', '自动生产'],
   ['ranch_buy', '自动补栏（金券）'],
+  ['ranch_activate_shed', '自动解锁一级棚（免费）'],
   ['ranch_upgrade', '自动升级建筑（金券）'],
   ['ranch_sell', '自动出售产物'],
-  ['ranch_market_organic', '仓鼠集市自动兑换有机化肥'],
+  ['ranch_market_organic_poop', '集市粑粑兑换有机化肥'],
+  ['ranch_market_organic_pinecone', '集市松果兑换有机化肥'],
   ['ranch_clean', '自动清理'],
   ['ranch_grass', '自动补充牧草'],
   ['ranch_grass_buy', '牧草不足时购买（金券）'],
@@ -60,6 +64,7 @@ const ranchSwitches = [
   ['ranch_feed_normal', '普通罐头喂养'],
   ['ranch_feed_organic', '有机罐头喂养'],
   ['ranch_task', '自动领取任务奖励'],
+  ['ranch_illustrated', '自动领取图鉴奖励'],
   ['ranch_share', '每日分享礼包'],
   ['ranch_daily_benefit', '每日商城福利'],
 ] as const
@@ -73,6 +78,10 @@ const ranchStrategies = [
   { label: '按已解锁等级', value: 'level' },
   { label: '指定动物', value: 'preferred' },
   { label: '优先背包幼崽', value: 'bag_priority' },
+]
+const ranchFeedNormalStages = [
+  { label: '任意可喂养阶段', value: 'any' },
+  { label: '仅最长生长阶段', value: 'longest' },
 ]
 </script>
 
@@ -95,11 +104,25 @@ const ranchStrategies = [
             </div>
           </div>
           <div v-if="panel === 'automation'" class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            <div v-for="[key, label] in ranchSwitches" :key="key" class="automation-setting-item">
+            <div
+              v-for="[key, label] in ranchSwitches"
+              :key="key"
+              class="automation-setting-item"
+              :class="{ 'ranch-feed-setting': key === 'ranch_feed_normal' }"
+            >
               <BaseSwitch v-model="settings.automation[key]" :label="label" :disabled="key === 'ranch_grass_buy' && !settings.automation.ranch_grass" />
+              <div v-if="key === 'ranch_feed_normal'" class="ranch-feed-stage">
+                <BaseSelect
+                  v-model="settings.automation.ranch_feed_normal_stage"
+                  aria-label="普通罐头使用阶段"
+                  size="small"
+                  :options="ranchFeedNormalStages"
+                  :disabled="!settings.automation.ranch_feed_normal"
+                />
+              </div>
             </div>
             <div class="col-span-full text-xs text-gray-500 dark:text-gray-400">
-              松果按 8 小时、4 小时、1 小时兑换，便便按 4 小时、1 小时兑换。到访或货币到账后排队，登录、重连和日常巡查时核对集市状态。
+              两种兑换可独立开启；松果按 8 小时、4 小时、1 小时兑换，粑粑按 4 小时、1 小时兑换。到访或货币到账后排队，登录、重连和日常巡查时核对集市状态。
             </div>
             <div class="automation-setting-item">
               <BaseInput v-model.number="settings.automation.ranch_grass_threshold_percent" class="w-full" label="牧草余量低于（%）时补满" type="number" min="1" max="100" step="1" :disabled="!settings.automation.ranch_grass" />
@@ -122,8 +145,21 @@ const ranchStrategies = [
             <BaseSelect v-model="settings.automation.ranch_strategy" label="养殖策略" :options="ranchStrategies" />
             <BaseSelect v-if="settings.automation.ranch_strategy === 'bag_priority'" v-model="settings.automation.ranch_bag_fallback" label="同类幼崽用完后" :options="ranchStrategies.slice(0, 2)" />
             <template v-if="settings.automation.ranch_strategy === 'preferred' || settings.automation.ranch_strategy === 'bag_priority' && settings.automation.ranch_bag_fallback === 'preferred'">
-              <BaseSelect v-model="settings.automation.ranch_coop_animal" label="窝 · 指定动物" :options="[{ value: 0, label: '不购买' }, ...ranchAnimalOptions.filter(animal => animal.kind === '窝')]" />
-              <BaseSelect v-model="settings.automation.ranch_shed_animal" label="棚 · 指定动物" :options="[{ value: 0, label: '不购买' }, ...ranchAnimalOptions.filter(animal => animal.kind === '棚')]" />
+              <p v-if="ranchAnimalOptionsLoading" class="col-span-full text-sm text-gray-500 dark:text-gray-400" role="status">
+                正在读取牧场动物选项…
+              </p>
+              <div v-else-if="ranchAnimalOptionsError" class="col-span-full flex flex-wrap items-center gap-2">
+                <p class="text-sm text-red-600 dark:text-red-400" role="alert">
+                  {{ ranchAnimalOptionsError }}
+                </p>
+                <BaseButton variant="secondary" size="sm" @click="emit('reloadAnimals')">
+                  重试
+                </BaseButton>
+              </div>
+              <template v-else>
+                <BaseSelect v-model="settings.automation.ranch_coop_animal" label="窝 · 指定动物" :options="[{ value: 0, label: '不购买' }, ...ranchAnimalOptions.filter(animal => animal.kind === '窝')]" />
+                <BaseSelect v-model="settings.automation.ranch_shed_animal" label="棚 · 指定动物" :options="[{ value: 0, label: '不购买' }, ...ranchAnimalOptions.filter(animal => animal.kind === '棚')]" />
+              </template>
             </template>
           </div>
           <RanchCubPriority
@@ -542,6 +578,18 @@ const ranchStrategies = [
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-control);
   background: color-mix(in srgb, var(--ui-surface-strong) 58%, transparent);
+}
+
+.ranch-feed-setting {
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding-block: 5px;
+}
+
+.ranch-feed-stage {
+  width: 9.5rem;
+  max-width: 100%;
 }
 
 @media (max-width: 1279px) {
